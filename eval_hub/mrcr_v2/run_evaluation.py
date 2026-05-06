@@ -20,16 +20,41 @@ score for the MRCR V2 task per example.
 
 import difflib
 import os
+import sys
+from typing import Sequence
 
+from absl import app
+from absl import flags
 import openai
 import pandas as pd
 
-# Modify these variables to run the evaluation on your own data.
-API_KEY = os.environ.get("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY")
-BASE_URL = os.environ.get("OPENAI_BASE_URL", None)
-MODEL_NAME = "gpt-5.5"
-INPUT_PATH = "mrcr_v2_data.csv"  # Must have 'queries' and 'answer' columns
-OUTPUT_PATH = "results.csv"
+FLAGS = flags.FLAGS
+
+flags.DEFINE_string(
+    "input_path",
+    "mrcr_v2_data.csv",
+    "Path to the input CSV file (must have 'queries' and 'answer' columns).",
+)
+flags.DEFINE_string(
+    "output_path",
+    "results.csv",
+    "Path to save the results CSV file.",
+)
+flags.DEFINE_string(
+    "model_name",
+    "gpt-5.5",
+    "The name of the OpenAI model to use.",
+)
+flags.DEFINE_string(
+    "openai_api_key",
+    None,
+    "OpenAI API key. If None, uses OPENAI_API_KEY env var.",
+)
+flags.DEFINE_string(
+    "openai_base_url",
+    None,
+    "OpenAI API base URL.",
+)
 
 
 def mrcr_v2_metric(prediction: str, target: str) -> float:
@@ -77,12 +102,28 @@ def mrcr_v2_metric(prediction: str, target: str) -> float:
   return d.ratio()
 
 
-def main() -> None:
+def main(argv: Sequence[str]) -> None:
+  if len(argv) > 1:
+    raise app.UsageError("Too many command-line arguments.")
 
   # --- Initialization ---
-  client = openai.OpenAI(api_key=API_KEY, base_url=BASE_URL)
-  df = pd.read_csv(INPUT_PATH)
-  print(f"Loaded {len(df)} samples. Starting evaluation...")
+  api_key = FLAGS.openai_api_key or os.environ.get("OPENAI_API_KEY")
+  if not api_key:
+    print("❌ ERROR: OpenAI API key not found. Use --openai_api_key or set OPENAI_API_KEY.")
+    sys.exit(1)
+
+  base_url = FLAGS.openai_base_url or os.environ.get("OPENAI_BASE_URL")
+  model_name = os.environ.get("OPENAI_MODEL_NAME") or FLAGS.model_name
+
+  client = openai.OpenAI(api_key=api_key, base_url=base_url)
+
+  if not os.path.exists(FLAGS.input_path):
+    print(f"❌ ERROR: Input file not found: {FLAGS.input_path}")
+    sys.exit(1)
+
+  df = pd.read_csv(FLAGS.input_path)
+  print(f"Loaded {len(df)} samples from {FLAGS.input_path}")
+  print(f"Starting evaluation with model: {model_name}")
 
   # --- Main Eval Loop ---
   for index, row in df.iterrows():
@@ -91,7 +132,7 @@ def main() -> None:
 
     try:
       response = client.chat.completions.create(
-          model=MODEL_NAME,
+          model=model_name,
           messages=[{"role": "user", "content": prompt}],
           temperature=1.0,
       )
@@ -112,9 +153,9 @@ def main() -> None:
 
   # --- Final Output ---
   print(f"Completed. Average Score: {df['score'].mean():.4f}")
-  df.to_csv(OUTPUT_PATH, index=False)
-  print(f"Results saved to {OUTPUT_PATH}")
+  df.to_csv(FLAGS.output_path, index=False)
+  print(f"Results saved to {FLAGS.output_path}")
 
 
 if __name__ == "__main__":
-  main()
+  app.run(main)
