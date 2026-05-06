@@ -1,0 +1,15 @@
+[project]
+name = "eval-hub"
+version = "0.1.0"
+description = "A collection of LLM benchmarks refactored for OpenAI compatibility."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0.0",
+    "pandas",
+    "Pillow",
+    "absl-py",
+]
+
+[tool.uv]
+managed = true

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""Basic Gemini evaluation script for LiveMath problems.
+r"""Basic OpenAI evaluation script for LiveMath problems.
 
 Expected Input Directory Structure (--input_dir):
 └── live_math/
@@ -27,7 +27,7 @@ Expected Input Directory Structure (--input_dir):
 
 Example usage:
 
-export GEMINI_API_KEY=<YOUR_API_KEY>
+export OPENAI_API_KEY=<YOUR_API_KEY>
 python evaluate.py \
   --input_dir=./live_math \
   --output_dir=./live_math/results \
@@ -45,6 +45,7 @@ blaze run //third_party/eval_hub/live_math:evaluate -- \
 # END GOOGLE-INTERNAL
 """
 
+import base64
 import collections
 import concurrent.futures
 import datetime
@@ -60,9 +61,7 @@ from typing import Any, Dict, Sequence
 from absl import app
 from absl import flags
 from absl import logging
-import google.ai.generativelanguage as glm
-from google.api_core import client_options as client_options_lib
-from google.api_core import exceptions as api_core_exceptions
+import openai
 import pandas as pd
 from PIL import Image  # pylint: disable=g-importing-member
 from PIL import UnidentifiedImageError  # pylint: disable=g-importing-member
@@ -95,7 +94,13 @@ _OUTPUT_DIR = flags.DEFINE_string(
     'output_dir', '.', 'Output directory for the results CSV file.'
 )
 _MODEL_NAME = flags.DEFINE_string(
-    'model_name', 'gemini-2.5-pro', 'The name of the Gemini model to use.'
+    'model_name', 'gpt-5.5', 'The name of the OpenAI model to use.'
+)
+_OPENAI_API_KEY = flags.DEFINE_string(
+    'openai_api_key', None, 'OpenAI API key. If None, uses OPENAI_API_KEY env var.'
+)
+_OPENAI_BASE_URL = flags.DEFINE_string(
+    'openai_base_url', None, 'OpenAI API base URL.'
 )
 _MAX_API_RETRIES = flags.DEFINE_integer(
     'max_api_retries', 3, 'Maximum number of retries for API calls.'
@@ -103,11 +108,13 @@ _MAX_API_RETRIES = flags.DEFINE_integer(
 
 
 def get_api_key() -> str | None:
-  """Retrieves the Gemini API key from environment variables."""
+  """Retrieves the OpenAI API key."""
+  if _OPENAI_API_KEY.value:
+    return _OPENAI_API_KEY.value
   try:
-    return os.environ['GEMINI_API_KEY']
+    return os.environ['OPENAI_API_KEY']
   except KeyError:
-    logging.error('❌ FATAL: GEMINI_API_KEY environment variable not found.')
+    logging.error('❌ FATAL: OPENAI_API_KEY environment variable not found.')
     return None
 
 
@@ -124,13 +131,13 @@ def load_system_prompt() -> str:
     return ''
 
 
-def get_gemini_solution(
+def get_openai_solution(
     problem_path: pathlib.Path,
     sample_num: int,
     multimodal_debug_flag: bool,
     system_prompt: str,
 ) -> Dict[str, Any]:
-  """Sends one problem to Gemini, parses the response, and returns the result.
+  """Sends one problem to OpenAI, parses the response, and returns the result.
 
   Args:
       problem_path: Path to the problem directory.
@@ -166,7 +173,11 @@ def get_gemini_solution(
           img = Image.open(f)
           if img:
             img.load()
-            image_parts.append(img)
+            # Encode image to base64
+            buffered = io.BytesIO()
+            img.save(buffered, format='PNG')
+            img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+            image_parts.append(img_base64)
           else:
             logging.warning(
                 'Failed to open image %s: Image.open() returned None', p
@@ -176,43 +187,42 @@ def get_gemini_solution(
       except Exception as e:  # pylint: disable=broad-exception-caught
         logging.warning('Unexpected error opening image %s: %s', p, e)
 
-    # Construct the full prompt
-    full_prompt = [system_prompt, '\n--- QUESTION ---\n', question]
+    # Construct the messages
+    messages = [
+        {'role': 'system', 'content': system_prompt},
+    ]
+    user_content = [{'type': 'text', 'text': question}]
     if image_parts and not multimodal_debug_flag:
-      full_prompt.append('\n--- IMAGES ---\n')
-      full_prompt.extend(image_parts)
+      for img_b64 in image_parts:
+        user_content.append({
+            'type': 'image_url',
+            'image_url': {'url': f'data:image/png;base64,{img_b64}'},
+        })
+    messages.append({'role': 'user', 'content': user_content})
 
     # Call API with retry logic
     raw_answer_text = 'API Failure'  # Default value
     parsed_number_str = ''
+    api_key = get_api_key()
+    if not api_key:
+      return {
+          'status': 'FAILURE',
+          'parsed_answer': None,
+          'raw_answer': 'API Key Missing',
+          'question': question,
+      }
+
+    client = openai.OpenAI(
+        api_key=api_key, base_url=_OPENAI_BASE_URL.value
+    )
+
     for attempt in range(_MAX_API_RETRIES.value):
       try:
-        api_key = get_api_key()
-        if not api_key:
-          raise ValueError('API key not found')
-        client_options = client_options_lib.ClientOptions(api_key=api_key)
-        client = glm.GenerativeServiceClient(client_options=client_options)
-
-        parts = []
-        for item in full_prompt:
-          if isinstance(item, str):
-            parts.append(glm.Part(text=item))
-          elif isinstance(item, Image.Image):
-            img_byte_arr = io.BytesIO()
-            item.save(img_byte_arr, format='PNG')
-            parts.append(
-                glm.Part(
-                    inline_data=glm.Blob(
-                        mime_type='image/png', data=img_byte_arr.getvalue()
-                    )
-                )
-            )
-
-        response = client.generate_content(
-            model=f'models/{_MODEL_NAME.value}',
-            contents=[glm.Content(parts=parts)],
+        response = client.chat.completions.create(
+            model=_MODEL_NAME.value,
+            messages=messages,
         )
-        raw_answer_text = response.candidates[0].content.parts[0].text.strip()
+        raw_answer_text = response.choices[0].message.content.strip()
 
         match = re.search(
             r'Final\s*answer:\s*(-?[\d\.]+)\s*$',
@@ -230,7 +240,7 @@ def get_gemini_solution(
           }
         else:
           logging.warning(
-              "       - WARNING: Could not find ' <number>' pattern at the"
+              "       - WARNING: Could not find 'Final answer: <number>' pattern at the"
               ' end of the response on attempt %d.',
               attempt + 1,
           )
@@ -246,7 +256,7 @@ def get_gemini_solution(
             attempt + 1,
             e,
         )
-      except api_core_exceptions.GoogleAPICallError as e:
+      except openai.OpenAIError as e:
         logging.warning(
             '       - WARNING: API call failed on attempt %d: %s',
             attempt + 1,
@@ -390,7 +400,7 @@ def main(argv: Sequence[str]) -> None:
       max_workers=_MAX_WORKERS.value
   ) as executor:
     future_to_job = {
-        executor.submit(get_gemini_solution, *job): job for job in jobs
+        executor.submit(get_openai_solution, *job): job for job in jobs
     }
     for future in concurrent.futures.as_completed(future_to_job):
       problem_path, _, _, _ = future_to_job[future]
@@ -454,8 +464,8 @@ def main(argv: Sequence[str]) -> None:
             )
             logging.info(debug_output)
 
-      row[f'gemini_parsed_answer_{sample_idx}'] = res['parsed_answer']
-      row[f'gemini_raw_answer_{sample_idx}'] = res['raw_answer']
+      row[f'model_parsed_answer_{sample_idx}'] = res['parsed_answer']
+      row[f'model_raw_answer_{sample_idx}'] = res['raw_answer']
       row[f'is_correct_{sample_idx}'] = is_correct
 
     row['samples_generated'] = successful_samples

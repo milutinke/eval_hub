@@ -19,14 +19,15 @@ score for the MRCR V2 task per example.
 """
 
 import difflib
+import os
 
-from google import genai
-from google.genai import types
+import openai
 import pandas as pd
 
 # Modify these variables to run the evaluation on your own data.
-API_KEY = "YOUR_GOOGLE_API_KEY"
-MODEL_NAME = "gemini-2.5-flash"
+API_KEY = os.environ.get("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY")
+BASE_URL = os.environ.get("OPENAI_BASE_URL", None)
+MODEL_NAME = "gpt-5.5"
 INPUT_PATH = "mrcr_v2_data.csv"  # Must have 'queries' and 'answer' columns
 OUTPUT_PATH = "results.csv"
 
@@ -79,7 +80,7 @@ def mrcr_v2_metric(prediction: str, target: str) -> float:
 def main() -> None:
 
   # --- Initialization ---
-  client = genai.Client(api_key=API_KEY)
+  client = openai.OpenAI(api_key=API_KEY, base_url=BASE_URL)
   df = pd.read_csv(INPUT_PATH)
   print(f"Loaded {len(df)} samples. Starting evaluation...")
 
@@ -88,13 +89,18 @@ def main() -> None:
     prompt = row["queries"]
     target = row["answer"]
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=[prompt],
-        config=types.GenerateContentConfig(temperature=1.0),
-    )
-    prediction = response.text if response.text else ""
-    if not response.text:
+    try:
+      response = client.chat.completions.create(
+          model=MODEL_NAME,
+          messages=[{"role": "user", "content": prompt}],
+          temperature=1.0,
+      )
+      prediction = response.choices[0].message.content if response.choices[0].message.content else ""
+    except openai.OpenAIError as e:
+      print(f"ALERT! API error for sample {index + 1}/{len(df)}: {e}")
+      prediction = ""
+
+    if not prediction:
       print(f"ALERT! No response for sample {index + 1}/{len(df)}")
 
     score = mrcr_v2_metric(prediction, target)

@@ -15,20 +15,20 @@
 r"""Putnam-Like Grading Script.
 
 This script iterates through a validated problem set, finds model-generated
-samples that match a specific pattern, and uses the Gemini API to grade them
+samples that match a specific pattern, and uses the OpenAI API to grade them
 based on the problem's official grading scheme.
 
 The output is a JSON file for each sample, structured like a human-graded
 review.
 
 Example usage (public):
-export GEMINI_API_KEY=<YOUR_API_KEY>
-python grade_samples.py --input_dir=./putnam_like --model_regex=gemini-2.5-pro --debug_k=2
+export OPENAI_API_KEY=<YOUR_API_KEY>
+python grade_samples.py --input_dir=./putnam_like --model_regex=gpt-4o --debug_k=2
 # BEGIN GOOGLE-INTERNAL
-export GEMINI_API_KEY=<YOUR_API_KEY>
+export OPENAI_API_KEY=<YOUR_API_KEY>
 blaze run //third_party/eval_hub/putnam_like:grade_samples -- \
   --input_dir=./putnam_like \
-  --model_regex=gemini-2.5-pro \
+  --model_regex=gpt-4o \
   --debug_k=2 --alsologtostderr
 # END GOOGLE-INTERNAL
 
@@ -60,15 +60,13 @@ import time
 from absl import app
 from absl import flags
 from absl import logging
-import google.ai.generativelanguage as glm
-from google.api_core import client_options as client_options_lib
-from google.api_core import exceptions as api_core_exceptions
+import openai
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string(
     "model_name",
-    "gemini-2.5-pro",
-    "The name of the Gemini model to use for grading.",
+    "gpt-5.5",
+    "The name of the OpenAI model to use for grading.",
 )
 flags.DEFINE_string(
     "input_dir",
@@ -76,10 +74,20 @@ flags.DEFINE_string(
     "Input directory for the validated problem folders.",
 )
 flags.DEFINE_string(
+    "openai_api_key",
+    None,
+    "OpenAI API key. If None, uses OPENAI_API_KEY env var.",
+)
+flags.DEFINE_string(
+    "openai_base_url",
+    None,
+    "OpenAI API base URL.",
+)
+flags.DEFINE_string(
     "model_regex",
     None,
     "Optional regex to filter model directories to grade (e.g.,"
-    " 'gemini-2-5-pro_.*'). Applied to the parent directory of the sample"
+    " 'gpt-5.5_.*'). Applied to the parent directory of the sample"
     " file.",
 )
 flags.DEFINE_string(
@@ -116,7 +124,7 @@ Your task is to evaluate a student's solution based on a provided problem statem
 6.  If there are errors in the solution, briefly categorize the types of mistakes made. If the solution is flawless, this can be null.
 
 **OUTPUT FORMAT:**
-Your final output MUST be a single, valid JSON object and nothing else. Do not wrap it in markdown fences. The JSON object must have the following structure:
+Your final output MUST be a single, valid JSON object and nothing else. The JSON object must have the following structure:
 {{
     "reviewer_id": "{model_name}",
     "grade": <integer between 0 and 10>,
@@ -127,15 +135,17 @@ Your final output MUST be a single, valid JSON object and nothing else. Do not w
 
 
 def get_api_key() -> str | None:
-  """Retrieves the Gemini API key from environment variables."""
+  """Retrieves the OpenAI API key."""
+  if FLAGS.openai_api_key:
+    return FLAGS.openai_api_key
   try:
-    return os.environ["GEMINI_API_KEY"]
+    return os.environ["OPENAI_API_KEY"]
   except KeyError:
-    logging.error("❌ FATAL: GEMINI_API_KEY environment variable not found.")
+    logging.error("❌ FATAL: OPENAI_API_KEY environment variable not found.")
     return None
 
 
-def grade_gemini_sample(
+def grade_openai_sample(
     input_path: pathlib.Path,
     sample_path: pathlib.Path,
     grader_timestamp: str,
@@ -147,7 +157,7 @@ def grade_gemini_sample(
       input_path: The base directory for relative path logging.
       sample_path: Path to the sample file to grade.
       grader_timestamp: Timestamp string for the grading session.
-      api_key: The Gemini API key.
+      api_key: The OpenAI API key.
 
   Returns:
       A tuple containing:
@@ -186,32 +196,27 @@ def grade_gemini_sample(
 
     # Construct the full prompt
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(model_name=FLAGS.model_name)
-    parts = [
-        glm.Part(text=system_prompt),
-        glm.Part(text="\n--- PROBLEM STATEMENT ---\n"),
-        glm.Part(text=question),
-        glm.Part(text="\n--- GRADING RUBRIC ---\n"),
-        glm.Part(text=grading_scheme),
-        glm.Part(text="\n--- STUDENT'S SOLUTION TO GRADE ---\n"),
-        glm.Part(text=solution_to_grade),
-    ]
+    user_content = (
+        f"\n--- PROBLEM STATEMENT ---\n{question}\n"
+        f"\n--- GRADING RUBRIC ---\n{grading_scheme}\n"
+        f"\n--- STUDENT'S SOLUTION TO GRADE ---\n{solution_to_grade}"
+    )
 
-    client_options = client_options_lib.ClientOptions(api_key=api_key)
-    client = glm.GenerativeServiceClient(client_options=client_options)
-    generation_config = glm.GenerationConfig(
-        temperature=FLAGS.temperature, response_mime_type="application/json"
-    )
-    request = glm.GenerateContentRequest(
-        model=f"models/{FLAGS.model_name}",
-        contents=[glm.Content(parts=parts)],
-        generation_config=generation_config,
-    )
+    client = openai.OpenAI(api_key=api_key, base_url=FLAGS.openai_base_url)
 
     # Call API with retry logic
     for attempt in range(FLAGS.max_api_retries):
       try:
-        response = client.generate_content(request)
-        raw_response_text = response.candidates[0].content.parts[0].text
+        response = client.chat.completions.create(
+            model=FLAGS.model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=FLAGS.temperature,
+            response_format={"type": "json_object"},
+        )
+        raw_response_text = response.choices[0].message.content
 
         # Robustly find the JSON block in the response
         json_match = re.search(r"\{.*\}", raw_response_text, re.DOTALL)
@@ -244,7 +249,7 @@ def grade_gemini_sample(
         return "SUCCESS", output_path, csv_data
 
       except (
-          api_core_exceptions.GoogleAPICallError,
+          openai.OpenAIError,
           ValueError,
           json.JSONDecodeError,
       ) as e:
@@ -348,7 +353,7 @@ def main(argv):
       max_workers=FLAGS.max_workers
   ) as executor:
     future_to_job = {
-        executor.submit(grade_gemini_sample, *job): job for job in jobs
+        executor.submit(grade_openai_sample, *job): job for job in jobs
     }
     for future in concurrent.futures.as_completed(future_to_job):
       _, sample_path, _, _ = future_to_job[future]
@@ -407,3 +412,4 @@ def main(argv):
 
 if __name__ == "__main__":
   app.run(main)
+

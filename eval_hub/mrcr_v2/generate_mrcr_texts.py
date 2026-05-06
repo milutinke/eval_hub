@@ -25,7 +25,7 @@ import time
 
 from absl import app
 from absl import flags
-from google import genai
+import openai
 
 
 FLAGS = flags.FLAGS
@@ -37,11 +37,10 @@ flags.DEFINE_boolean("fewshot", False, "Whether to generate fewshot texts.")
 
 
 ### Model generation details. ###
-MODEL_NAME = (  # Can replace with other models as desired.
-    "gemini-3-flash-preview"
-)
-GEMINI_API_KEY = "YOUR_API_KEY_HERE"
-MODEL_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
+MODEL_NAME = os.environ.get("OPENAI_MODEL_NAME", "gpt-5.5")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "YOUR_API_KEY_HERE")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", None)
+MODEL_CLIENT = openai.OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
 ### Configuration details. ###
 
@@ -187,11 +186,11 @@ def save_results_robustly(
 ##### Functions for generating the filler and target texts. #####
 def get_llm_response(text_prompt: str) -> str:
   """Returns the LLM response to the given text prompt."""
-  response = MODEL_CLIENT.models.generate_content(
+  response = MODEL_CLIENT.chat.completions.create(
       model=MODEL_NAME,
-      contents=[text_prompt],
+      messages=[{"role": "user", "content": text_prompt}],
   )
-  return response.text
+  return response.choices[0].message.content
 
 
 def is_valid_generation(text: str, error_prefix: str) -> bool:

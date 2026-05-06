@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""Basic Gemini evaluation script for Live Math problems.
+r"""Basic OpenAI evaluation script for Live Math problems.
 
 Example usage (public):
-export GEMINI_API_KEY=<YOUR_API_KEY>
+export OPENAI_API_KEY=<YOUR_API_KEY>
 python generate_samples.py --input_dir=./putnam_like --num_samples=1
 # BEGIN GOOGLE-INTERNAL
-export GEMINI_API_KEY=<YOUR_API_KEY>
+export OPENAI_API_KEY=<YOUR_API_KEY>
 blaze run //third_party/eval_hub/putnam_like:generate_samples -- \
   --input_dir=./putnam_like \
   --num_samples=1 \
@@ -38,6 +38,7 @@ Expected Input Directory Structure (--input_dir):
                 └── ... (other model samples)
 """
 
+import base64
 import concurrent.futures
 import datetime
 import io
@@ -50,9 +51,7 @@ from typing import Any, Dict, Sequence
 from absl import app
 from absl import flags
 from absl import logging
-import google.ai.generativelanguage as glm
-from google.api_core import client_options as client_options_lib
-from google.api_core import exceptions as api_core_exceptions
+import openai
 from PIL import Image  # pylint: disable=g-importing-member
 from PIL import UnidentifiedImageError  # pylint: disable=g-importing-member
 
@@ -78,7 +77,13 @@ _DEBUG_K = flags.DEFINE_integer(
     ' problems.',
 )
 _MODEL_NAME = flags.DEFINE_string(
-    'model_name', 'gemini-2.5-pro', 'The name of the Gemini model to use.'
+    'model_name', 'gpt-5.5', 'The name of the OpenAI model to use.'
+)
+_OPENAI_API_KEY = flags.DEFINE_string(
+    'openai_api_key', None, 'OpenAI API key. If None, uses OPENAI_API_KEY env var.'
+)
+_OPENAI_BASE_URL = flags.DEFINE_string(
+    'openai_base_url', None, 'OpenAI API base URL.'
 )
 _MAX_API_RETRIES = flags.DEFINE_integer(
     'max_api_retries', 3, 'Maximum number of retries for API calls.'
@@ -89,11 +94,13 @@ _TEMPERATURE = flags.DEFINE_float(
 
 
 def get_api_key() -> str | None:
-  """Retrieves the Gemini API key from environment variables."""
+  """Retrieves the OpenAI API key."""
+  if _OPENAI_API_KEY.value:
+    return _OPENAI_API_KEY.value
   try:
-    return os.environ['GEMINI_API_KEY']
+    return os.environ['OPENAI_API_KEY']
   except KeyError:
-    logging.error('❌ FATAL: GEMINI_API_KEY environment variable not found.')
+    logging.error('❌ FATAL: OPENAI_API_KEY environment variable not found.')
     return None
 
 
@@ -109,12 +116,12 @@ def load_system_prompt() -> str:
     return ''
 
 
-def get_gemini_sample(
+def get_openai_sample(
     problem_path: pathlib.Path,
     sample_num: int,
     system_prompt: str,
 ) -> Dict[str, Any]:
-  """Sends one problem to Gemini and returns the raw response.
+  """Sends one problem to OpenAI and returns the raw response.
 
   Args:
       problem_path: Path to the problem directory.
@@ -147,7 +154,11 @@ def get_gemini_sample(
           img = Image.open(f)
           if img:
             img.load()
-            image_parts.append(img)
+            # Encode image to base64
+            buffered = io.BytesIO()
+            img.save(buffered, format='PNG')
+            img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+            image_parts.append(img_base64)
           else:
             logging.warning(
                 'Failed to open image %s: Image.open() returned None', p
@@ -157,54 +168,46 @@ def get_gemini_sample(
       except Exception as e:  # pylint: disable=broad-exception-caught
         logging.warning('Unexpected error opening image %s: %s', p, e)
 
-    # Construct the full prompt
-    full_prompt = [system_prompt, '\n--- QUESTION ---\n', question]
+    # Construct the messages
+    messages = [
+        {'role': 'system', 'content': system_prompt},
+    ]
+    user_content = [{'type': 'text', 'text': question}]
     if image_parts:
-      full_prompt.append('\n--- IMAGES ---\n')
-      full_prompt.extend(image_parts)
+      for img_b64 in image_parts:
+        user_content.append({
+            'type': 'image_url',
+            'image_url': {'url': f'data:image/png;base64,{img_b64}'},
+        })
+    messages.append({'role': 'user', 'content': user_content})
 
     # Call API with retry logic
     raw_answer_text = 'API Failure'  # Default value
+    api_key = get_api_key()
+    if not api_key:
+      return {
+          'status': 'FAILURE',
+          'raw_answer': 'API Key Missing',
+      }
+
+    client = openai.OpenAI(
+        api_key=api_key, base_url=_OPENAI_BASE_URL.value
+    )
+
     for attempt in range(_MAX_API_RETRIES.value):
       try:
-        api_key = get_api_key()
-        if not api_key:
-          raise ValueError('API key not found')
-        client_options = client_options_lib.ClientOptions(api_key=api_key)
-        client = glm.GenerativeServiceClient(client_options=client_options)
-
-        parts = []
-        for item in full_prompt:
-          if isinstance(item, str):
-            parts.append(glm.Part(text=item))
-          elif isinstance(item, Image.Image):
-            img_byte_arr = io.BytesIO()
-            item.save(img_byte_arr, format='PNG')
-            parts.append(
-                glm.Part(
-                    inline_data=glm.Blob(
-                        mime_type='image/png', data=img_byte_arr.getvalue()
-                    )
-                )
-            )
-
-        generation_config = glm.GenerationConfig(
+        response = client.chat.completions.create(
+            model=_MODEL_NAME.value,
+            messages=messages,
             temperature=_TEMPERATURE.value,
         )
-
-        request = glm.GenerateContentRequest(
-            model=f'models/{_MODEL_NAME.value}',
-            contents=[glm.Content(parts=parts)],
-            generation_config=generation_config,
-        )
-        response = client.generate_content(request)
-        raw_answer_text = response.candidates[0].content.parts[0].text
+        raw_answer_text = response.choices[0].message.content
         return {
             'status': 'SUCCESS',
             'raw_answer': raw_answer_text,
         }
 
-      except api_core_exceptions.GoogleAPICallError as e:
+      except openai.OpenAIError as e:
         logging.warning(
             '       - WARNING: API call failed on attempt %d: %s',
             attempt + 1,
@@ -361,7 +364,7 @@ def main(argv: Sequence[str]) -> None:
       max_workers=_MAX_WORKERS.value
   ) as executor:
     future_to_job = {
-        executor.submit(get_gemini_sample, **job): job for job in jobs
+        executor.submit(get_openai_sample, **job): job for job in jobs
     }
     for future in concurrent.futures.as_completed(future_to_job):
       job = future_to_job[future]
